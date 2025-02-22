@@ -1,4 +1,4 @@
-# StarDetect Bus Pass
+# Bus Pass
 
 A comprehensive school bus tracking and management system built with React and Firebase.
 
