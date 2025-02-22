@@ -1,0 +1,761 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Allow reading schools collection for verification without authentication
+    match /schools/{schoolId} {
+      allow read: if true;  // Allows public reading of school IDs for verification
+    }
+
+    // Simplified transportationInfo collection rules
+    match /transportationInfo/{studentId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && (
+        isSuperAdmin() || 
+        isSchoolAdmin() || 
+        (isParent() && (
+          request.auth.uid == get(/databases/$(database)/documents/users/$(studentId)).data.parentUid ||
+          getUserData().email == get(/databases/$(database)/documents/users/$(studentId)).data.parentEmail
+        ))
+      );
+    }
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function hasApprovedSuperAdmin() {
+      return exists(/databases/$(database)/documents/users) && 
+             exists(/databases/$(database)/documents/users) && 
+             get(/databases/$(database)/documents/users).where('role', '==', 'SUPERADMIN')
+             .where('status', '==', 'approved').size() > 0;
+    }
+
+    // Initial setup rules - Allow access when no approved SuperAdmin exists
+    match /setup/{document=**} {
+      allow read, write: if !hasApprovedSuperAdmin();
+    }
+
+    // Users collection - Initial access
+    match /users/{userId} {
+      allow read: if isAuthenticated() && (
+        userId == request.auth.uid || 
+        (getUserData().status == 'approved' && (
+          getUserData().role == 'SUPERADMIN' ||
+          (getUserData().role == 'SCHOOLADMIN' && belongsToSchool(resource.data.schoolId))
+        ))
+      ) || hasAuthorizedAccess(userId);
+      allow create: if true; // Allow signup, status will be 'pending'
+      allow update: if isAuthenticated() && (
+        userId == request.auth.uid || // Allow users to update their own basic info
+        (getUserData().status == 'approved' && (
+          getUserData().role == 'SUPERADMIN' ||
+          (getUserData().role == 'SCHOOLADMIN' && belongsToSchool(resource.data.schoolId))
+        )) ||
+        // Allow parents to update their children's profile picture
+        (isParent() && (
+          resource.data.parentUid == request.auth.uid ||
+          resource.data.parentEmail == getUserData().email ||
+          (resource.data.parentIds != null && resource.data.parentIds.hasAny([request.auth.uid]))
+        ) && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['profilePictureUrl']))
+      );
+      allow delete: if isAuthenticated() && getUserData().status == 'approved' && (
+        getUserData().role == 'SUPERADMIN' ||
+        (getUserData().role == 'SCHOOLADMIN' && belongsToSchool(resource.data.schoolId))
+      );
+    }
+
+    // Helper function to check if a user has authorized access through a delegate
+    function hasAuthorizedAccess(userId) {
+      let querySnapshot = get(/databases/$(database)/documents/delegates);
+      return querySnapshot.hasAll([userId]);
+    }
+
+    // Allow initial access to check SuperAdmin status
+    match /users/{userId} {
+      allow read: if true;
+    }
+
+    function hasSuperAdmin() {
+      return exists(/databases/$(database)/documents/users) && 
+             getAfter(/databases/$(database)/documents/users).where('role', '==', 'SUPERADMIN')
+             .where('status', '==', 'approved').size() > 0;
+    }
+
+    // Initial setup and authentication
+    match /{document=**} {
+      allow read: if isAuthenticated() || !hasSuperAdmin();
+    }
+
+    // Users collection - Initial access
+    match /users/{userId} {
+      allow read: if isAuthenticated() || !hasSuperAdmin();
+      allow create: if 
+        // First user must be SuperAdmin with stardetect.us email
+        (!hasSuperAdmin() &&
+         request.resource.data.role == 'SUPERADMIN' &&
+         request.resource.data.email.matches('.*@stardetect[.]us')) ||
+        // Regular user creation
+        isAuthenticated();
+    }
+
+    // Real-time collections
+    match /busLocations/{busId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && request.resource.data.schoolId == getUserData().schoolId) ||
+        (isBusDriver() && request.resource.data.driverId == request.auth.uid)
+      );
+      allow update: if request.auth != null && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && request.resource.data.schoolId == getUserData().schoolId) ||
+        (isBusDriver() && request.resource.data.driverId == request.auth.uid)
+      );
+      allow delete: if request.auth != null && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && resource.data.schoolId == getUserData().schoolId)
+      );
+    }
+
+    match /notifications/{notificationId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    match /updates/{updateId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    function isUserApproved() {
+      let userData = getUserData();
+      return userData != null && userData.status != null && 
+             (userData.status == 'APPROVED' || userData.status == 'approved' || userData.status == 'ACTIVE' || userData.status == 'active');
+    }
+
+    function isUserDoc(userId) {
+      return request.auth.uid == userId;
+    }
+    
+    function belongsToSchool(schoolId) {
+      let userData = getUserData();
+      return userData != null && userData.schoolId == schoolId;
+    }
+
+    function isStudentParent(studentData) {
+      let userData = getUserData();
+      return studentData != null && userData != null && (
+        studentData.parentUid == request.auth.uid ||
+        studentData.parentEmail == userData.email ||
+        (studentData.parentIds != null && studentData.parentIds.hasAny([request.auth.uid]))
+      );
+    }
+
+    function isStudentTeacher(studentData) {
+      return studentData.teacherIds.hasAny([request.auth.uid]);
+    }
+
+    function isRouteBusDriver(routeData) {
+      return routeData.driverUid == request.auth.uid;
+    }
+    
+    function isSuperAdmin() {
+      return isAuthenticated() && 
+             isUserApproved() && 
+             getUserData().role == 'SUPERADMIN' &&
+             request.auth.token.email.matches('.*@stardetect[.]us');
+    }
+    
+    function isSchoolAdmin() {
+      let user = getUserData();
+      return request.auth != null && 
+             user != null &&
+             user.role == 'SCHOOLADMIN' &&
+             user.status == 'approved';
+    }
+    
+    function isTeacher() {
+      return isAuthenticated() && 
+             isUserApproved() && 
+             getUserData().role == 'TEACHER';
+    }
+    
+    function isBusDriver() {
+      return isAuthenticated() && 
+             isUserApproved() && 
+             getUserData().role == 'BUSDRIVER';
+    }
+    
+    function isParent() {
+      let userData = getUserData();
+      return userData != null && 
+             (userData.role == 'PARENT' || userData.role == 'parent') && 
+             (userData.status == 'APPROVED' || userData.status == 'approved' || userData.status == 'ACTIVE' || userData.status == 'active');
+    }
+
+    function isStudent() {
+      return isAuthenticated() && 
+             isUserApproved() && 
+             getUserData().role == 'STUDENT';
+    }
+
+    // Allow initial setup for first SuperAdmin
+    match /users/{userId} {
+      allow read: if true;
+      allow create: if 
+        // Allow creation of first SuperAdmin
+        (request.resource.data.role == 'SUPERADMIN' && 
+         request.resource.data.email.matches('.*@stardetect[.]us') &&
+         !exists(/databases/$(database)/documents/users)) ||
+        // Regular user creation rules
+        (isAuthenticated() && (
+          userId == request.auth.uid || 
+          isSuperAdmin() || 
+          (isSchoolAdmin() && belongsToSchool(resource.data.schoolId))
+        ));
+      allow update: if isAuthenticated() && (
+        isSuperAdmin() || 
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) || 
+        (userId == request.auth.uid && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'schoolId', 'status']))
+      );
+      allow delete: if isSuperAdmin() || (isSchoolAdmin() && belongsToSchool(resource.data.schoolId));
+    }
+
+    // Allow initial audit logs
+    match /auditLogs/{logId} {
+      allow read: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() || 
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId))
+      );
+      allow create: if isAuthenticated() || 
+        // Allow creation of setup audit logs
+        (!exists(/databases/$(database)/documents/users));
+      allow update, delete: if false; // Audit logs should never be modified or deleted
+    }
+
+    // Schools collection
+    match /schools/{schoolId} {
+      allow read: if isAuthenticated();
+      allow create: if isSuperAdmin();
+      allow update: if isSuperAdmin() || (isSchoolAdmin() && belongsToSchool(schoolId));
+      allow delete: if isSuperAdmin();
+
+      // School-specific collections
+      match /classes/{classId} {
+        allow read: if isAuthenticated() && isUserApproved() && (isSuperAdmin() || isSchoolAdmin() || (isTeacher() && belongsToSchool(schoolId)));
+        allow write: if isAuthenticated() && isUserApproved() && (isSuperAdmin() || (isSchoolAdmin() && belongsToSchool(schoolId)));
+      }
+    }
+
+    // Users collection
+    match /users/{userId} {
+      allow read: if isAuthenticated() && (
+        userId == request.auth.uid || 
+        (getUserData().status == 'approved' && (
+          getUserData().role == 'SUPERADMIN' ||
+          (getUserData().role == 'SCHOOLADMIN' && belongsToSchool(resource.data.schoolId))
+        ))
+      ) || hasAuthorizedAccess(userId);
+      allow create: if true; // Allow signup, status will be 'pending'
+      allow update: if isAuthenticated() && (
+        userId == request.auth.uid || // Allow users to update their own basic info
+        (getUserData().status == 'approved' && (
+          getUserData().role == 'SUPERADMIN' ||
+          (getUserData().role == 'SCHOOLADMIN' && belongsToSchool(resource.data.schoolId))
+        )) ||
+        // Allow parents to update their children's profile picture
+        (isParent() && (
+          resource.data.parentUid == request.auth.uid ||
+          resource.data.parentEmail == getUserData().email ||
+          (resource.data.parentIds != null && resource.data.parentIds.hasAny([request.auth.uid]))
+        ) && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['profilePictureUrl']))
+      );
+      allow delete: if isAuthenticated() && getUserData().status == 'approved' && (
+        getUserData().role == 'SUPERADMIN' ||
+        (getUserData().role == 'SCHOOLADMIN' && belongsToSchool(resource.data.schoolId))
+      );
+    }
+
+    // Students collection
+    match /students/{studentId} {
+      allow read: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() || 
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) || 
+        (isTeacher() && belongsToSchool(resource.data.schoolId)) || 
+        (isBusDriver() && belongsToSchool(resource.data.schoolId)) || 
+        (isParent() && isStudentParent(resource.data))
+      );
+      allow create: if 
+        isAuthenticated() && (
+          isSuperAdmin() ||
+          (isSchoolAdmin() && request.resource.data.schoolId == getUserData().schoolId)
+        );
+      allow update: if 
+        isAuthenticated() && (
+          isSuperAdmin() ||
+          (isSchoolAdmin() && (
+            resource.data.schoolId == getUserData().schoolId ||
+            request.resource.data.schoolId == getUserData().schoolId
+          ))
+        );
+      allow delete: if 
+        isAuthenticated() && (
+          isSuperAdmin() ||
+          (isSchoolAdmin() && resource.data.schoolId == getUserData().schoolId)
+        );
+
+      match /attendance/{recordId} {
+        allow read: if isAuthenticated() && isUserApproved() && (
+          isSuperAdmin() || 
+          (isSchoolAdmin() && belongsToSchool(get(/databases/$(database)/documents/students/$(studentId)).data.schoolId)) || 
+          (isTeacher() && belongsToSchool(get(/databases/$(database)/documents/students/$(studentId)).data.schoolId)) || 
+          (isParent() && isStudentParent(get(/databases/$(database)/documents/students/$(studentId)).data))
+        );
+        allow write: if isAuthenticated() && isUserApproved() && (
+          isSuperAdmin() || 
+          (isSchoolAdmin() && belongsToSchool(get(/databases/$(database)/documents/students/$(studentId)).data.schoolId)) || 
+          (isTeacher() && belongsToSchool(get(/databases/$(database)/documents/students/$(studentId)).data.schoolId))
+        );
+      }
+
+      match /pickupHistory/{recordId} {
+        allow read: if isAuthenticated() && isUserApproved() && (
+          isSuperAdmin() || 
+          (isSchoolAdmin() && belongsToSchool(get(/databases/$(database)/documents/students/$(studentId)).data.schoolId)) || 
+          (isTeacher() && belongsToSchool(get(/databases/$(database)/documents/students/$(studentId)).data.schoolId)) || 
+          (isParent() && isStudentParent(get(/databases/$(database)/documents/students/$(studentId)).data))
+        );
+        allow write: if isAuthenticated() && isUserApproved() && (
+          isSuperAdmin() || 
+          (isSchoolAdmin() && belongsToSchool(get(/databases/$(database)/documents/students/$(studentId)).data.schoolId)) || 
+          (isTeacher() && belongsToSchool(get(/databases/$(database)/documents/students/$(studentId)).data.schoolId))
+        );
+      }
+    }
+
+    // Routes collection
+    match /routes/{routeId} {
+      allow read: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() || 
+        belongsToSchool(resource.data.schoolId)
+      );
+      allow write: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() || 
+        (isSchoolAdmin() && belongsToSchool(request.resource.data.schoolId))
+      );
+
+      match /stops/{stopId} {
+        allow read: if isAuthenticated() && isUserApproved() && (
+          isSuperAdmin() || 
+          belongsToSchool(get(/databases/$(database)/documents/routes/$(routeId)).data.schoolId)
+        );
+        allow write: if isAuthenticated() && isUserApproved() && (
+          isSuperAdmin() || 
+          (isSchoolAdmin() && belongsToSchool(get(/databases/$(database)/documents/routes/$(routeId)).data.schoolId))
+        );
+      }
+    }
+
+    // Bus locations collection
+    match /busLocations/{busId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && request.resource.data.schoolId == getUserData().schoolId) ||
+        (isBusDriver() && request.resource.data.driverId == request.auth.uid)
+      );
+      allow update: if request.auth != null && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && request.resource.data.schoolId == getUserData().schoolId) ||
+        (isBusDriver() && request.resource.data.driverId == request.auth.uid)
+      );
+      allow delete: if request.auth != null && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && resource.data.schoolId == getUserData().schoolId)
+      );
+    }
+
+    // Incidents collection
+    match /incidents/{incidentId} {
+      allow read: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() || 
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) || 
+        (isBusDriver() && belongsToSchool(resource.data.schoolId))
+      );
+      allow create: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() || 
+        (isSchoolAdmin() && belongsToSchool(request.resource.data.schoolId)) || 
+        (isBusDriver() && belongsToSchool(request.resource.data.schoolId))
+      );
+      allow update: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() || 
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) || 
+        (isBusDriver() && resource.data.reportedBy == request.auth.uid)
+      );
+      allow delete: if isSuperAdmin() || (isSchoolAdmin() && belongsToSchool(resource.data.schoolId));
+    }
+
+    // Messages collection
+    match /messages/{messageId} {
+      allow read: if isAuthenticated() && isUserApproved() && (
+        resource.data.participants.hasAny([request.auth.uid]) ||
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId))
+      );
+      allow create: if isAuthenticated() && isUserApproved();
+      allow update: if isAuthenticated() && isUserApproved() && (
+        resource.data.participants.hasAny([request.auth.uid]) ||
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId))
+      );
+      allow delete: if isSuperAdmin() || (isSchoolAdmin() && belongsToSchool(resource.data.schoolId));
+    }
+
+    // Notifications collection
+    match /notifications/{notificationId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null;
+    }
+
+    // Real-time updates collection
+    match /updates/{updateId} {
+      allow read, write: if request.auth != null;
+    }
+
+    // Check-ins collection
+    match /checkIns/{checkInId} {
+      allow read: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) ||
+        (isTeacher() && belongsToSchool(resource.data.schoolId)) ||
+        (isParent() && isStudentParent(get(/databases/$(database)/documents/students/$(resource.data.studentId)).data))
+      );
+      allow create: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(request.resource.data.schoolId)) ||
+        (isTeacher() && belongsToSchool(request.resource.data.schoolId))
+      );
+      allow update: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) ||
+        (isBusDriver() && resource.data.busId == getUserData().busId) ||
+        (isTeacher() && resource.data.teacherUid == request.auth.uid)
+      );
+      allow delete: if isSuperAdmin() || (isSchoolAdmin() && belongsToSchool(resource.data.schoolId));
+    }
+
+    // Buddy passes collection
+    match /buddyPasses/{passId} {
+      allow read: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) ||
+        (isTeacher() && belongsToSchool(resource.data.schoolId)) ||
+        (isParent() && (
+          isStudentParent(get(/databases/$(database)/documents/students/$(resource.data.studentId)).data) ||
+          isStudentParent(get(/databases/$(database)/documents/students/$(resource.data.buddyStudentId)).data)
+        ))
+      );
+      allow create: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(request.resource.data.schoolId)) ||
+        (isParent() && isStudentParent(get(/databases/$(database)/documents/students/$(request.resource.data.studentId)).data))
+      );
+      allow update: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) ||
+        (isBusDriver() && belongsToSchool(resource.data.schoolId)) ||
+        (isParent() && isStudentParent(get(/databases/$(database)/documents/students/$(resource.data.studentId)).data))
+      );
+      allow delete: if isSuperAdmin() || (isSchoolAdmin() && belongsToSchool(resource.data.schoolId));
+    }
+
+    // Guest pickups collection
+    match /guestPickups/{pickupId} {
+      allow read: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) ||
+        (isTeacher() && belongsToSchool(resource.data.schoolId)) ||
+        (isParent() && resource.data.parentId == request.auth.uid)
+      ) || resource.data.token == request.query.token;
+      allow create: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(request.resource.data.schoolId)) ||
+        (isParent() && request.resource.data.parentId == request.auth.uid)
+      );
+      allow update: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) ||
+        (isParent() && resource.data.parentId == request.auth.uid)
+      );
+      allow delete: if isSuperAdmin() || (isSchoolAdmin() && belongsToSchool(resource.data.schoolId));
+    }
+
+    // Delegates collection (authorized pickup persons)
+    match /delegates/{delegateId} {
+      allow read: if true; // Allow public read access for delegates
+      allow create: if isAuthenticated() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(request.resource.data.schoolId)) ||
+        (isParent() && request.resource.data.parentUid == request.auth.uid)
+      );
+      allow update: if isAuthenticated() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) ||
+        (isParent() && resource.data.parentUid == request.auth.uid)
+      );
+      allow delete: if isAuthenticated() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) ||
+        (isParent() && resource.data.parentUid == request.auth.uid)
+      );
+    }
+
+    // Walking students collection
+    match /walkingStudents/{walkingId} {
+      allow read: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) ||
+        (isTeacher() && belongsToSchool(resource.data.schoolId)) ||
+        (isParent() && isStudentParent(get(/databases/$(database)/documents/students/$(resource.data.studentId)).data))
+      );
+      allow create, update: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(request.resource.data.schoolId)) ||
+        (isTeacher() && belongsToSchool(request.resource.data.schoolId))
+      );
+      allow delete: if isSuperAdmin() || (isSchoolAdmin() && belongsToSchool(resource.data.schoolId));
+    }
+
+    // Emergency contacts collection
+    match /emergencyContacts/{contactId} {
+      allow read: if isAuthenticated() && (
+        isSuperAdmin() ||
+        isSchoolAdmin() ||
+        isTeacher() ||
+        isBusDriver() ||
+        (isParent() && isStudentParent(get(/databases/$(database)/documents/users/$(resource.data.studentId)).data)) ||
+        (isStudent() && request.auth.uid == resource.data.studentId)
+      );
+      
+      allow create: if isAuthenticated() && (
+        isSuperAdmin() ||
+        isSchoolAdmin() ||
+        (isParent() && isStudentParent(get(/databases/$(database)/documents/users/$(request.resource.data.studentId)).data)) ||
+        (isStudent() && request.auth.uid == request.resource.data.studentId)
+      );
+      
+      allow update: if isAuthenticated() && (
+        isSuperAdmin() ||
+        isSchoolAdmin() ||
+        (isParent() && isStudentParent(get(/databases/$(database)/documents/users/$(resource.data.studentId)).data)) ||
+        (isStudent() && request.auth.uid == resource.data.studentId)
+      );
+      
+      allow delete: if isAuthenticated() && (
+        isSuperAdmin() ||
+        isSchoolAdmin() ||
+        (isParent() && isStudentParent(get(/databases/$(database)/documents/users/$(resource.data.studentId)).data)) ||
+        (isStudent() && request.auth.uid == resource.data.studentId)
+      );
+    }
+
+    // Settings collection
+    match /settings/{settingId} {
+      allow read: if isAuthenticated() && isUserApproved();
+      allow write: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() || 
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId))
+      );
+    }
+
+    // Audit logs collection
+    match /auditLogs/{logId} {
+      allow read: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() || 
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId))
+      );
+      allow create: if isAuthenticated();
+      allow update, delete: if false; // Audit logs should never be modified or deleted
+    }
+
+    // Contact inquiries collection - allow anyone to create, but only admins to read
+    match /contactInquiries/{inquiryId} {
+      allow create: if true; // Allow anyone to submit contact form
+      allow read: if isAuthenticated() && (isSuperAdmin() || isSchoolAdmin());
+      allow update, delete: if isAuthenticated() && isSuperAdmin();
+    }
+
+    // System Settings collection
+    match /systemSettings/{document} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    // Driver-specific collections
+    match /drivers/{driverId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(request.resource.data.schoolId))
+      );
+      allow update: if isAuthenticated() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) ||
+        (request.auth.uid == driverId)
+      );
+      allow delete: if isAuthenticated() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId))
+      );
+    }
+
+    // Bus routes collection
+    match /busRoutes/{routeId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAuthenticated() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(request.resource.data.schoolId))
+      );
+      allow delete: if isAuthenticated() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId))
+      );
+    }
+
+    // Driver routes collection
+    match /driverRoutes/{routeId} {
+      allow read: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) ||
+        (isBusDriver() && resource.data.driverUid == request.auth.uid)
+      );
+      allow create, update: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(request.resource.data.schoolId))
+      );
+      allow delete: if isSuperAdmin() || (isSchoolAdmin() && belongsToSchool(resource.data.schoolId));
+    }
+
+    // Driver assignments collection
+    match /driverAssignments/{assignmentId} {
+      allow read: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) ||
+        (isBusDriver() && resource.data.driverUid == request.auth.uid)
+      );
+      allow create, update: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(request.resource.data.schoolId))
+      );
+      allow delete: if isSuperAdmin() || (isSchoolAdmin() && belongsToSchool(resource.data.schoolId));
+    }
+
+    // Driver schedules collection
+    match /driverSchedules/{scheduleId} {
+      allow read: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) ||
+        (isBusDriver() && resource.data.driverUid == request.auth.uid)
+      );
+      allow create, update: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(request.resource.data.schoolId)) ||
+        (isBusDriver() && request.resource.data.driverUid == request.auth.uid)
+      );
+      allow delete: if isSuperAdmin() || (isSchoolAdmin() && belongsToSchool(resource.data.schoolId));
+    }
+
+    // Bus locations collection (updated)
+    match /busLocations/{busId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) ||
+        (getUserData().role == 'BUSDRIVER' && getUserData().status == 'approved')
+      );
+    }
+
+    // Buses collection
+    match /buses/{busId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && request.resource.data.schoolId == getUserData().schoolId)
+      );
+      allow update: if request.auth != null && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && request.resource.data.schoolId == getUserData().schoolId)
+      );
+      allow delete: if request.auth != null && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && resource.data.schoolId == getUserData().schoolId)
+      );
+    }
+
+    // Bus locations collection (for real-time tracking)
+    match /busLocations/{busId} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && request.resource.data.schoolId == getUserData().schoolId) ||
+        (isBusDriver() && request.resource.data.driverId == request.auth.uid)
+      );
+      allow delete: if request.auth != null && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && resource.data.schoolId == getUserData().schoolId)
+      );
+    }
+
+    match /tempAccessTokens/{tokenId} {
+      allow read: if true; // Allow public read access for tokens
+      allow create: if 
+        // Validate delegate exists
+        exists(/databases/$(database)/documents/delegates/$(request.resource.data.delegateId)) &&
+        // Validate required fields and types
+        request.resource.data.keys().hasAll(['delegateId', 'status', 'createdAt', 'expiresAt', 'authorizedStudents']) &&
+        request.resource.data.status == 'ACTIVE' &&
+        request.resource.data.delegateId is string &&
+        request.resource.data.expiresAt is timestamp &&
+        request.resource.data.createdAt is timestamp &&
+        request.resource.data.authorizedStudents is list;
+      allow write: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() || 
+        isSchoolAdmin() || 
+        (isParent() && request.resource.data.parentUid == request.auth.uid)
+      );
+      allow delete: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() || 
+        isSchoolAdmin() || 
+        (isParent() && resource.data.parentUid == request.auth.uid)
+      );
+    }
+
+    // Pickups collection
+    match /pickups/{pickupId} {
+      allow read: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) ||
+        (isTeacher() && resource.data.teacherUid == request.auth.uid) ||
+        (isParent() && (
+          get(/databases/$(database)/documents/students/$(resource.data.studentId)).data.parentIds.hasAny([request.auth.uid]) ||
+          get(/databases/$(database)/documents/students/$(resource.data.studentId)).data.parentUid == request.auth.uid
+        ))
+      );
+      allow create: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(request.resource.data.schoolId)) ||
+        (isTeacher() && request.resource.data.teacherUid == request.auth.uid)
+      );
+      allow update: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() ||
+        (isSchoolAdmin() && belongsToSchool(resource.data.schoolId)) ||
+        (isTeacher() && resource.data.teacherUid == request.auth.uid)
+      );
+      allow delete: if isSuperAdmin() || (isSchoolAdmin() && belongsToSchool(resource.data.schoolId));
+    }
+  }
+}

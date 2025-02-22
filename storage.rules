@@ -1,0 +1,202 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isUserApproved() {
+      let userData = getUserData();
+      return userData != null && userData.status != null && 
+             (userData.status == 'APPROVED' || userData.status == 'approved' || 
+              userData.status == 'ACTIVE' || userData.status == 'active');
+    }
+
+    function getUserData() {
+      return firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isSuperAdmin() {
+      return isAuthenticated() && 
+             isUserApproved() && 
+             getUserData().role == 'SUPERADMIN' &&
+             request.auth.token.email.matches('.*@stardetect[.]us');
+    }
+
+    function isSchoolAdmin() {
+      return isAuthenticated() && 
+             isUserApproved() && 
+             getUserData().role == 'SCHOOLADMIN';
+    }
+
+    function isParent() {
+      let userData = getUserData();
+      return isAuthenticated() && 
+             userData != null &&
+             (userData.role == 'PARENT' || userData.role == 'parent');
+    }
+
+    function belongsToSchool(schoolId) {
+      return getUserData().schoolId == schoolId;
+    }
+
+    function isValidFileSize() {
+      return request.resource.size <= 5 * 1024 * 1024; // 5MB limit
+    }
+
+    function isImage() {
+      return request.resource.contentType.matches('image/.*');
+    }
+
+    function isPDF() {
+      return request.resource.contentType.matches('application/pdf');
+    }
+
+    function isDocument() {
+      return request.resource.contentType.matches('application/pdf') ||
+             request.resource.contentType.matches('application/msword') ||
+             request.resource.contentType.matches('application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+    }
+
+    function isStudentParent(studentId) {
+      let student = firestore.get(/databases/(default)/documents/users/$(studentId)).data;
+      let userData = getUserData();
+      return student != null && userData != null && (
+        student.parentUid == request.auth.uid ||
+        student.parentEmail == userData.email ||
+        (student.parentIds != null && student.parentIds.hasAny([request.auth.uid]))
+      );
+    }
+
+    // Allow initial setup access for profile pictures and QR codes
+    match /profile-pictures/{userId} {
+      allow read: if true;
+      allow write: if 
+        // Allow initial SuperAdmin setup
+        (!exists(/databases/(default)/documents/users)) ||
+        // Regular write rules
+        (isAuthenticated() && 
+         (
+           request.auth.uid == userId || // Own profile picture
+           isSuperAdmin() || // Super admin can manage all
+           (isSchoolAdmin() && belongsToSchool(firestore.get(/databases/(default)/documents/users/$(userId)).data.schoolId)) || // School admin can manage their school's users
+           (isParent() && isStudentParent(userId)) // Parent can manage their children's pictures
+         ) &&
+         isImage() &&
+         isValidFileSize());
+      allow delete: if isAuthenticated() && 
+                   (
+                     request.auth.uid == userId ||
+                     isSuperAdmin() ||
+                     (isSchoolAdmin() && belongsToSchool(firestore.get(/databases/(default)/documents/users/$(userId)).data.schoolId)) ||
+                     (isParent() && isStudentParent(userId))
+                   );
+    }
+
+    // School-specific storage
+    match /schools/{schoolId}/{allPaths=**} {
+      allow read: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() || 
+        (isSchoolAdmin() && belongsToSchool(schoolId))
+      );
+      allow write: if isAuthenticated() && isUserApproved() && (
+        isSuperAdmin() || 
+        (isSchoolAdmin() && belongsToSchool(schoolId))
+      ) && isValidFileSize();
+    }
+
+    // QR Code Storage
+    match /qr-codes/{userId}/{fileName} {
+      allow read: if true; // Public read for QR codes
+      allow write: if isAuthenticated() && 
+                  isUserApproved() &&
+                  request.auth.uid == userId &&
+                  isImage() &&
+                  isValidFileSize();
+      allow delete: if isAuthenticated() && 
+                   isUserApproved() &&
+                   (request.auth.uid == userId || isSuperAdmin());
+    }
+
+    // Bus Pass QR Codes (Temporary)
+    match /temp-passes/{passId} {
+      allow read: if true;
+      allow write: if isAuthenticated() && 
+                  isUserApproved() &&
+                  isImage() && 
+                  isValidFileSize();
+      allow delete: if isAuthenticated() && 
+                   isUserApproved() &&
+                   (isSuperAdmin() || isSchoolAdmin());
+    }
+
+    // Guest Pass QR Codes
+    match /guest-passes/{passId} {
+      allow read: if true;
+      allow write: if isAuthenticated() && 
+                  isUserApproved() &&
+                  isImage() && 
+                  isValidFileSize();
+      allow delete: if isAuthenticated() && 
+                   isUserApproved() &&
+                   (isSuperAdmin() || isSchoolAdmin());
+    }
+
+    // Student Documents
+    match /student-documents/{studentId}/{documentType}/{fileName} {
+      allow read: if isAuthenticated() && 
+                 isUserApproved() && 
+                 (isSuperAdmin() || 
+                  (isSchoolAdmin() && belongsToSchool(
+                    firestore.get(/databases/(default)/documents/students/$(studentId)).data.schoolId
+                  )));
+      allow write: if isAuthenticated() && 
+                  isUserApproved() && 
+                  (isSuperAdmin() || 
+                   (isSchoolAdmin() && belongsToSchool(
+                     firestore.get(/databases/(default)/documents/students/$(studentId)).data.schoolId
+                   ))) &&
+                  isDocument() &&
+                  isValidFileSize();
+    }
+
+    // Bus Route Maps
+    match /route-maps/{routeId} {
+      allow read: if isAuthenticated() && 
+                 isUserApproved();
+      allow write: if isAuthenticated() && 
+                  isUserApproved() && 
+                  (isSuperAdmin() || 
+                   (isSchoolAdmin() && belongsToSchool(
+                     firestore.get(/databases/(default)/documents/routes/$(routeId)).data.schoolId
+                   ))) &&
+                  isImage() &&
+                  isValidFileSize();
+    }
+
+    // Incident Reports
+    match /incident-reports/{incidentId}/{fileName} {
+      allow read: if isAuthenticated() && 
+                 isUserApproved() && 
+                 (isSuperAdmin() || 
+                  (isSchoolAdmin() && belongsToSchool(
+                    firestore.get(/databases/(default)/documents/incidents/$(incidentId)).data.schoolId
+                  )));
+      allow write: if isAuthenticated() && 
+                  isUserApproved() && 
+                  (isSuperAdmin() || 
+                   (isSchoolAdmin() && belongsToSchool(
+                     firestore.get(/databases/(default)/documents/incidents/$(incidentId)).data.schoolId
+                   ))) &&
+                  (isImage() || isPDF()) &&
+                  isValidFileSize();
+    }
+
+    // Default deny
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+} 

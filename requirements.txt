@@ -1,0 +1,41 @@
+# Core Dependencies
+react@18.3.1
+react-dom@18.3.1
+react-router-dom@6.28.1
+react-scripts@5.0.1
+
+# UI Components
+@mui/material@5.16.13
+@mui/icons-material@5.14.19
+@emotion/react@11.14.0
+@emotion/styled@11.14.0
+react-beautiful-dnd@13.1.1
+
+# Firebase
+firebase@10.14.1
+
+# Authentication
+jsonwebtoken@9.0.2
+bcryptjs@2.4.3
+express-jwt@8.4.1
+cookie-parser@1.4.6
+
+# Maps and Location
+@react-google-maps/api@2.20.5
+
+# QR Code
+qrcode.react@3.2.0
+
+# HTTP Client
+axios@1.6.2
+
+# Real-time Communication
+socket.io-client@4.7.2
+
+# Testing
+@testing-library/jest-dom@5.17.0
+@testing-library/react@13.4.0
+@testing-library/user-event@13.5.0
+
+# Performance Monitoring
+web-vitals@2.1.4 
